@@ -142,3 +142,19 @@ XRING_DEBUG=1 node XringCLI/index.js in.lua -o out.lua             # env form
 - CLOSURE's nested MOVE test uses the remapped MOVE wire id (`__MOVE_ID__`).
 - Interpreter loop is a real `while true`.
 - JMP / FORPREP / FORLOOP targets are packed as K_FWD / K_BWD relative to 1-based PC.
+
+## Known limits (measured)
+
+| Limit | Value | Why / what happens |
+|---|---|---|
+| Single string literal decoded per `charFunc` call | 7990 bytes | The intern filler decodes a literal byte-per-byte into consecutive registers and calls the decoder once; the VM performs that call with `unpack(F, first, last)`, which tops out around 8000 results. Literals above the limit are decoded in 4000-byte batches and `CONCAT`ed, so there is no hard ceiling any more — but keeping a literal under 7990 bytes preserves the historical single-call layout byte for byte. |
+| Filler register window | `min(longestLiteral, 4000) + ~14` | Follows from the batch size; long literals no longer inflate `maxstack` to `literalLength + 16`. |
+
+## Junk blocks
+
+`Factorizer/arith/JunkCode.js` injects never-taken blocks whose guard must be a
+tautology. `x == x` is **not** one (IEEE-754: every comparison with NaN is
+false), so a payload that computes NaN (`0/0`, `inf - inf`) used to fall into
+the dead arm — traps and `F`/`Opcodes`/`PC` writes. Guards are therefore
+spelled `(x == x) or (x ~= x)` (always true) and `(x == x) and (x ~= x)`
+(always false); both are correct for every value including NaN.

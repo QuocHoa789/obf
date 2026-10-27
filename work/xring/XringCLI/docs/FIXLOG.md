@@ -141,8 +141,7 @@ Yêu cầu gốc: run obfuscator thử và run output trên Lune xem có ra outp
 
 ## Rủi ro còn biết (chưa fix)
 
-- Junk `F[x]==F[x]` sai thành false nếu `F[x]` là NaN (payload chứa NaN
-  như `0/0`) → dead arm có thể chạy. Hiếm, để lại.
+- ~~Junk `F[x]==F[x]` sai thành false nếu `F[x]` là NaN~~ → **đã fix ở Sprint 4**.
 - `hasBareBreak` còn giữ làm wrapper (không dùng nội bộ nữa).
 - Base85 tail: blob Lua decode dài hơn raw vài byte pad (encoder không lưu
   độ dài thật); vô hại vì deserializer không bao giờ đọc quá vùng thật.
@@ -368,5 +367,136 @@ thật (Luau 0.744 CLI build từ source), so sánh *4 nguồn*: IR interpreter
 - Hiện tượng treo `v1` ghi nhận ở sprint 2 **không còn reproducer** (file
   `/tmp` đã mất) và toàn bộ corpus hiện chạy `0 timeout`; nếu gặp lại cần
   lưu file input + seed trước khi điều tra tiếp.
-- Junk predicate `F[x] == F[x]` sai nếu `F[x]` là `NaN` (payload chứa `0/0`).
-  Hiếm, giữ nguyên.
+- ~~Junk predicate `F[x] == F[x]` sai nếu `F[x]` là `NaN`~~ → **đã fix ở
+  Sprint 4** (xem dưới).
+
+# Sprint 4 (2026-10-26) — 3 bug gốc còn lại sau khi user test ZIP
+
+Bối cảnh: sau khi nhận `xring_fixed.zip`, user test thêm và báo còn lỗi. Kiểm
+tra lại thì đúng là còn **3 bug gốc** (đều có trong archive gốc, không phải
+regression của các sprint trước), trong đó 2 bug trước đây bị phân loại sai.
+
+## A. `Factorizer/arith/JunkCode.regEq/regNe` — guard junk sai khi gặp NaN
+
+- **Triệu chứng**: `local x = 0/0 print(x ~= x)` → bản obfuscate chết với
+  `bad argument` (hoặc `attempt to compare nil < nil`); thêm `{junk:false}`
+  thì đúng (`true`). 12/13 cấu hình pass đều sai, chỉ `junk:false` đúng.
+- **Nguyên nhân**: `predTrue()` phát ra tautology `F[g] == F[g]`. IEEE-754:
+  mọi so sánh với NaN đều **false**, nên khi register đang giữ NaN
+  (`0/0`, `inf-inf`, …) guard lật thành false ⇒ **dead arm** (trap + ghi
+  `F`/`Opcodes`/`PC`) thực sự chạy. `regNe()` (`F[g] ~= F[g]`, kỳ vọng luôn
+  false) sai theo chiều ngược lại.
+- **Fix**: viết rõ cả hai nửa để bất biến đúng với **mọi** giá trị, kể cả NaN:
+  - `predTrue`  : `(F[g] == F[g]) or  (F[g] ~= F[g])`  — luôn true
+  - `predFalse` : `(F[g] == F[g]) and (F[g] ~= F[g])`  — luôn false
+- **Ảnh hưởng byte output**: đây là **thay đổi byte có chủ ý duy nhất trên
+  diện rộng** — text của guard junk đổi với mọi input có junk (mặc định).
+  Không thể tránh: predicate được *in vào output*, mà tautology `x == x`
+  không thể vừa giữ nguyên text vừa đúng với NaN. Ngữ nghĩa không đổi
+  (`audit_outputs` + `rt_sweep` xác nhận), chỉ phần *dead* (không bao giờ
+  được chạy) đổi cách viết. Muốn quay lại byte cũ: revert đúng 2 dòng trong
+  `JunkCode.js` (comment mô tả tại chỗ).
+- **Test hồi quy**: `test.js` — `junk guards stay true/false for NaN (IEEE-754)`
+  (240 predicate × 8 giá trị gồm NaN/`nil`/string/table, chạy qua
+  compile+interpret: đã xác nhận **FAIL** trên code cũ) và
+  `junk blocks never trap on a NaN register`.
+
+## B. `Compilers/intern/InternPass` — literal dài ≥ ~8000 byte ⇒ `too many results to unpack`
+
+- **Triệu chứng**: một string literal dài (đo được: 7990 byte OK, 8000 byte
+  fail) làm cả file obfuscate chết ngay khi load:
+  `too many results to unpack`. Input lớn nhất trong `examples/`
+  (`Higay.lua` 16 297 byte, `higa2.lua` 17 127 byte) fail vì đúng lý do này.
+- **Nguyên nhân**: filler decode string **từng byte vào các register liên
+  tiếp** rồi gọi `charFunc` **một lần** với `CALL B = len + 1`
+  (`fill.maxstack = litLen + 16`). VM thực hiện call đó bằng
+  `unpack(F, first, last)` → số kết quả ≈ độ dài literal, vượt giới hạn
+  stack của `unpack` (~8000) ⇒ lỗi.
+- **Fix**: khi pool có literal > `SINGLE_CALL_MAX = 7990` byte thì decode
+  **theo lô 4000 byte**: mỗi lô `CALL` ≤ 4000 arg, kết quả `CONCAT` dần vào
+  `R_acc`. Chỉ số byte `i` vẫn là chỉ số **toàn cục** nên chuỗi keystream /
+  `Rmix` / `Rstate` không đổi; `maxstack` từ `litLen + 16` xuống còn
+  `R_acc2 + 1` (≈ 2018 cho literal 8 KB; 43 480 → ~2018 cho `Higay`).
+- **Bảo toàn byte**: literal ≤ 7990 byte (mọi input từng chạy được) đi qua
+  nhánh cũ **nguyên vẹn** — `RK`, `maxstack`, toàn bộ bytecode không đổi
+  (đã đo hash: 10/300/2000/4000/7990 byte **IDENTICAL** với trước fix;
+  7991/8000 byte đổi — đúng nhóm từng fail).
+- **Test hồi quy**: `long string literal (> 7990 bytes) decodes in batches`
+  (kiểm tra có `CONCAT`, không call nào > 4000 arg, `maxstack < 4200`, và
+  decode đúng độ dài) + `short string literal keeps the single-call decoder`
+  (literal 4000 byte: **không** có `CONCAT` ⇒ layout cũ được giữ).
+- **Đo sau fix**: literal 300 / 1999 / 2000 / 2001 / 4000 / 4001 / 7990 /
+  7991 / 8000 / 9000 byte đều decode đúng trên Luau. `Higay.lua` và
+  `higa2.lua` obfuscate xong (10.9 MB / 10.8 MB) và **không còn**
+  `too many results to unpack`.
+
+## C. `FunctionSplit.rewrite` — biến vòng lặp che bảng env/scratch ⇒ `attempt to index number with number`
+
+- **Triệu chứng**: 4/40 seed (7, 15, 25, 33) sinh file chết ngay khi chạy
+  (`print(1)` cũng chết). Trước đây bị bỏ qua vì bản gốc **không parse được**
+  trên Luau nên không ai chạy tới chỗ này.
+- **Nguyên nhân**: `ObjectSplitEngine.fresh()` chỉ tránh keyword + tên method,
+  **không** tránh identifier của chính chunk đang rewrite. Khi tên bảng
+  `env`/`n` (scratch) trùng tên biến `for` của source, thân vòng lặp đọc
+  `env[1][slot]` nhưng `env` đã bị biến đếm che ⇒ index vào number. Bản gốc
+  cũng dính y hệt (`for l=(l)[38.0],y do (l[0x25__])[l]=true`) — chỉ là file
+  gốc không chạy được nên lỗi bị che.
+- **Fix**: `FunctionSplit.loopShadowsEnv()` — nếu biến vòng lặp trùng
+  `ctx.envName`/`ctx.nName` **và** thân vòng thật sự đọc bảng đó
+  (`loopBodyTables()` phân biệt slot env vs slot scratch) thì đổi tên biến
+  vòng bằng `repairLoopName()` (deterministic, **không** lấy rng) và map lại
+  các reference trong thân qua `ctx.varRename`; giới hạn `start/stop/step`
+  giữ scope ngoài (Lua đánh giá chúng trước khi biến vòng tồn tại).
+- **Bảo toàn byte**: shadow *vô hại* (thân không đọc bảng) **không** bị đổi
+  tên ⇒ output giữ nguyên; chỉ nhóm từng chết mới đổi.
+- **Test hồi quy**: `test.js` — `loop var never shadows the generated
+  env/scratch table` (env-slot, scratch-slot, shadow vô hại, tên không liên
+  quan) — **FAIL** trên code cũ.
+- **Đo sau fix**: `print(1)` seed 1–40 pass hết; `rt_sweep
+  --seeds=7,15,25,33` **PASS 256 / FAIL 0**; 67 case `nojunk` seed 2
+  (arith, precedence, …) trước đây fail cũng pass; không case nào từng PASS
+  bị đổi byte (xem diff bên dưới).
+
+## Bảo toàn output — kiểm chứng bằng snapshot 268 case
+
+Chụp hash (`sha256[0:16]:len`) cho **65 corpus + `input.lua` + `demo.lua` ×
+seed 1,2 × {default, junk:false} = 268 case** *trước* khi sửa, rồi so lại:
+
+| Nhóm | Số case | Kết luận |
+|---|---|---|
+| Giống **từng byte** | 67 | `nojunk` seed 1 và các case không bị ảnh hưởng |
+| Chỉ khác phần guard junk (bug A) | 134 | toàn bộ case `default`; ngữ nghĩa không đổi |
+| Đổi vì **trước đó fail** (bug C) | 67 | 66/67 giờ PASS, 1 `semicolon` NO-ORACLE |
+
+Đối chiếu riêng nhóm 67 (65 corpus + `input.lua` + `demo.lua`, seed 2,
+`junk:false` — seed 2 là seed hay trùng tên bảng env): chạy cả bản *trước
+fix* và *sau fix* trên Luau → trước fix **0 PASS** (tất cả đều
+`attempt to index number with number`), sau fix **66 PASS / 1 NO-ORACLE**
+(`semicolon`, Luau không parse `;;`) ⇒ **không input nào từng chạy đúng mà bị
+đổi byte**.
+
+## Validation của sprint này (Luau 0.744 làm oracle)
+
+| Gate | Kết quả |
+|---|---|
+| `node XringCLI/tests/test.js` | **188 passed, 0 failed** (+5 test mới; 3 test mới đã xác nhận FAIL trên code cũ) |
+| `node tools/split_selftest.js` | **11/11 PASS** |
+| `node tools/rt_sweep.js --seeds=1,2,3` | **PASS 192 / FAIL 0 / ERROR 0 / NO-ORACLE 3** |
+| `node tools/rt_sweep.js --seeds=7,15,25,33` | **PASS 256 / FAIL 0 / ERROR 0 / NO-ORACLE 4** |
+| `node tools/diff_lua.js --seeds 1` | **61 pass / 3 fail / 1 blocked / 0 timeout** (3 fail: oracle/harness, xem dưới) |
+| `node tools/audit_baseline.js ../baseline/xring --seeds=1` | **0 REGRESSION**, 1 `STILL-BROKEN` (`semicolon`) |
+| `node tools/audit_outputs.js --seeds=1` | debug-neutrality **PASS** (195 lượt) |
+| `demo20k` seed 1/2/3 | `413323` (khớp plain) |
+| Literal dài | 300 … 9000 byte decode đúng; `Higay`/`higa2` obfuscate xong, không còn `too many results to unpack` |
+| Performance (`demo20k`, seed 1, 3 lần) | 6.5–7.1 s (bản gốc 5.7–6.0 s; output gốc không chạy được) |
+
+## Phân loại lại (sửa nhận định sai của sprint trước)
+
+- `Higay.lua`, `higa2.lua`: **KHÔNG** phải "fixture ngoài phạm vi" — chúng
+  fail đúng vì bug B (`too many results to unpack`). Đã fix.
+- `long-string` trong `diff_lua`: vẫn là khác biệt **harness** (output chứa
+  newline nên bị tách dòng khác nhau khi so text), **không** liên quan bug B.
+- `arith`, `mod-neg` trong `diff_lua`: khác biệt **oracle** (fengari Lua 5.3
+  vs Luau: `-7 % 3`, `inf` vs `Infinity`); bản plain chạy trên Luau cho kết
+  quả y bản obfuscate.
+- `semicolon`: **NO-ORACLE** — Luau không parse `;;` kiểu Lua 5.1.

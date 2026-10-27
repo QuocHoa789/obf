@@ -2760,5 +2760,114 @@ t('key rename is skipped when pairs/next can observe table keys', () => {
   );
 });
 
+// --- Sprint 4 regressions -------------------------------------------------
+
+t('junk guards stay true/false for NaN (IEEE-754)', () => {
+  // Regression: `F[g] == F[g]` is false when the register holds NaN (0/0,
+  // inf-inf, ...), which flipped the guard and ran the DEAD arm (traps and VM
+  // state writes) -> "bad argument" at runtime.
+  const J = require('../../Factorizer/arith/JunkCode');
+  const blob = Buffer.alloc(64);
+  for (let i = 0; i < 64; i++) blob[i] = (i * 37 + 11) & 0xff;
+  const bytes = '{' + Array.from(blob).join(',') + '}';
+  const prelude = [
+    `local __b = ${bytes}`,
+    'local buffer = {readu8 = function(_, p) return __b[p + 1] end}',
+    `local ${J.BUF} = __b`,
+    '',
+  ].join('\n');
+  const values = ['0/0', '1/0 - 1/0', '(0/0) * -1', 'math.huge - math.huge', '42', '"str"', 'nil', '{}'];
+  for (const seed of [1, 2, 3, 7]) {
+    J.srand(require('../../Compilers/encode/Serializer').mulberry32(seed));
+    for (let i = 0; i < 120; i++) {
+      const tPred = J.predTrue(blob, blob.length);
+      const fPred = J.predFalse(blob, blob.length);
+      const v = values[i % values.length];
+      const g = 3 + (i % 5);
+      const src = `${prelude}local F = {} F[${g}] = ${v} print(tostring(${tPred}), tostring(${fPred}))`;
+      prints(src, ['true\tfalse']);
+    }
+  }
+});
+
+t('junk blocks never trap on a NaN register', () => {
+  for (const seed of [1, 2, 7]) {
+    const src = 'local x = 0/0\nprint(x ~= x, x == x, 1/0 > 0)';
+    const r = runObfuscated(src, { seed });
+    assert.deepStrictEqual(r.printOut, ['true\tfalse\ttrue']);
+  }
+});
+
+t('long string literal (> 7990 bytes) decodes in batches', () => {
+  const big = 'x'.repeat(9000);
+  const src = `local s = "${big}"\nprint(#s)`;
+  const r = obfuscate(src, { filename: 's.lua', seed: 1 });
+  // The filler builds the string with `string.char(unpack(F, 3, 3 + n))`; more
+  // than ~8000 arguments overflowed unpack. Batched decoding keeps one call per
+  // 4000 bytes and concatenates the pieces.
+  const protos = [];
+  const walk = (p) => {
+    protos.push(p);
+    (p.protos || []).forEach(walk);
+  };
+  walk(r.proto);
+  const filler = protos.find((p) => p._kind === 'fill');
+  assert.ok(filler, 'filler proto must exist');
+  const concat = (filler.code || []).filter((i) => i.op === 'CONCAT').length;
+  const calls = (filler.code || []).filter((i) => i.op === 'CALL');
+  assert.ok(concat >= 2, 'batched decode must concatenate pieces, got ' + concat);
+  assert.ok(calls.every((c) => c.B <= 4001), 'no call may pass more than 4000 args');
+  assert.ok(filler.maxstack < 4200, 'register window must stay bounded, got ' + filler.maxstack);
+  const vm = runObfuscated(src, { seed: 1 });
+  assert.deepStrictEqual(vm.printOut, ['9000']);
+});
+
+t('short string literal keeps the single-call decoder', () => {
+  const src = 'local s = "' + 'y'.repeat(4000) + '"\nprint(#s)';
+  const r = obfuscate(src, { filename: 's.lua', seed: 1 });
+  const protos = [];
+  const walk = (p) => {
+    protos.push(p);
+    (p.protos || []).forEach(walk);
+  };
+  walk(r.proto);
+  const filler = protos.find((p) => p._kind === 'fill');
+  assert.ok(filler, 'filler proto must exist');
+  assert.strictEqual((filler.code || []).filter((i) => i.op === 'CONCAT').length, 0);
+});
+
+t('loop var never shadows the generated env/scratch table', () => {
+  // Seeds 7, 15, 25, 33 used to pick an env-table name (`fresh()`) that a
+  // source numeric-for already used, so the loop body indexed the counter
+  // ("attempt to index number with number").
+  const { ObjectSplitEngine } = require('../../Factorizer/TableObjectmethod/ObjectSplit');
+  const engine = new ObjectSplitEngine(() => 0.5);
+  engine.slots.set('envVar', 3);   // read as env[1][3]
+  const ctx = {
+    bound: new Set(['j']),
+    envName: 'j',
+    nName: 'q',
+    scratch: new Map([['scrVar', 4]]),  // read as q[4]
+  };
+  const ref = (name) => [{
+    type: 'CallStatement',
+    expr: { type: 'CallExpression', callee: { type: 'Identifier', name }, args: [] },
+  }];
+  // env table read by the body: a loop var spelled `j` breaks it.
+  assert.strictEqual(engine.loopShadowsEnv('j', ctx, ref('envVar')), true);
+  // scratch table read by the body: a loop var spelled `q` breaks it.
+  assert.strictEqual(engine.loopShadowsEnv('q', ctx, ref('scrVar')), true);
+  // Wrong table: harmless shadow, must keep its exact output.
+  assert.strictEqual(engine.loopShadowsEnv('j', ctx, ref('scrVar')), false);
+  assert.strictEqual(engine.loopShadowsEnv('q', ctx, ref('envVar')), false);
+  const plain = [{ type: 'AssignmentStatement', vars: [{ type: 'Identifier', name: 'k' }], inits: [{ type: 'NumericLiteral', value: 1, raw: '1' }] }];
+  assert.strictEqual(engine.loopShadowsEnv('j', ctx, plain), false);
+  assert.strictEqual(engine.loopShadowsEnv('zz', ctx, ref('envVar')), false);
+  const fixed = engine.repairLoopName('j', ctx, ref('envVar'));
+  assert.notStrictEqual(fixed, 'j');
+  assert.notStrictEqual(fixed, 'q');
+  assert.ok(/^[A-Za-z_][A-Za-z0-9_]*$/.test(fixed), 'repair name must be a plain identifier: ' + fixed);
+});
+
 process.stdout.write('\n' + passed + ' passed, ' + failed + ' failed\n');
 process.exit(failed ? 1 : 0);

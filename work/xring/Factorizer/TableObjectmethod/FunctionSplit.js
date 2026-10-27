@@ -65,6 +65,31 @@ function pickRepairName(forbidden, alsoUsed) {
   return null;
 }
 
+function collectAllNames(node, out) {
+  if (!node || typeof node !== 'object') return out;
+  if (Array.isArray(node)) {
+    for (const n of node) collectAllNames(n, out);
+    return out;
+  }
+  if (node.type === 'Identifier' && typeof node.name === 'string') out.add(node.name);
+  if (node.type === 'LocalStatement') for (const n of node.names || []) if (typeof n === 'string') out.add(n);
+  if (node.type === 'ForNumericStatement' && typeof node.name === 'string') out.add(node.name);
+  if (node.type === 'ForGenericStatement') for (const n of node.names || []) if (typeof n === 'string') out.add(n);
+  if (node.params) for (const p of node.params) if (typeof p === 'string') out.add(p);
+  for (const k of Object.keys(node)) {
+    if (k === 'loc' || k === 'raw' || k === 'method' || k === 'property') continue;
+    const v = node[k];
+    if (v && typeof v === 'object') collectAllNames(v, out);
+  }
+  return out;
+}
+
+function withRename(map, from, to) {
+  const next = new Map(map || []);
+  next.set(from, to);
+  return next;
+}
+
 function collectNestedFnNames(node, out) {
   out = out || new Set();
   if (!node || typeof node !== 'object') return out;
@@ -258,6 +283,80 @@ function attachFunctionSplit(cls) {
       default:
         return false;
     }
+  };
+
+  /**
+   * A generated function-scope local (the `env` table accessed as
+   * `env[1][slot]`) can end up with the same spelling as a loop variable that
+   * the source already declares: ObjectSplit's `fresh()` only avoids keywords
+   * and table-method names, not identifiers in the chunk it rewrites. A
+   * numeric `for` re-declares its variable from the body on, so the loop body's
+   * `env[1][slot]` reads would index the loop counter instead of the env table
+   * (`attempt to index number with number`). Repair the loop variable instead:
+   * the collision is rare, so every other obfuscation keeps its exact rng
+   * stream and byte-identical output. Deterministic, RNG-free.
+   */
+  /**
+   * True when a loop variable would hide the enclosing function's env table.
+   * `envName` is only set for scopes that already read locals through slots;
+   * a plain (pre-split) scope has no env table to shadow.
+   */
+  P.loopShadowsEnv = function loopShadowsEnv(name, ctx, body) {
+    if (!ctx || typeof name !== 'string') return false;
+    // Two generated tables can live in the same scope: the env table
+    // (`envName`, read as env[1][slot]) and the extracted method's scratch
+    // table (`nName`, read as n[slot]). A loop variable spelled like either
+    // shadows it for the whole body, so its slot reads index a number.
+    // Only repair when the body really reads that table: a harmless shadow
+    // must keep its exact output (and its exact rng stream).
+    const hitsEnv = !!ctx.envName && name === ctx.envName;
+    const hitsN = !!ctx.nName && name === ctx.nName;
+    if (!hitsEnv && !hitsN) return false;
+    const used = this.loopBodyTables(body, ctx);
+    return (hitsEnv && used.env) || (hitsN && used.n);
+  };
+
+  /** Which generated tables (`env`/`n`) the loop body resolves names through. */
+  P.loopBodyTables = function loopBodyTables(body, ctx) {
+    const used = { env: false, n: false };
+    const walk = (n) => {
+      if (!n || typeof n !== 'object') return;
+      if (Array.isArray(n)) {
+        for (const x of n) walk(x);
+        return;
+      }
+      if (n.type === 'Identifier') {
+        const name = n.name;
+        if (!ctx.bound.has(name)) {
+          if (ctx.scratch && ctx.scratch.has(name)) used.n = true;
+          else if (this.methods.has(name) || this.slots.has(name) || GLOBAL_FUNCS[name]) used.env = true;
+        }
+        return;
+      }
+      if (n.type === 'MemberExpression' && n.object && n.object.type === 'Identifier') {
+        const key = n.object.name + '.' + n.property;
+        if (LIB_MEMBERS[key]) used.env = true;
+      }
+      for (const k of Object.keys(n)) {
+        if (k === 'loc' || k === 'raw' || k === 'method' || k === 'property') continue;
+        const v = n[k];
+        if (v && typeof v === 'object') walk(v);
+      }
+    };
+    walk(body);
+    return used;
+  };
+
+  P.repairLoopName = function repairLoopName(name, ctx, node) {
+    const taken = new Set(ctx.bound || []);
+    taken.add(name);
+    if (ctx.envName) taken.add(ctx.envName);
+    if (ctx.nName) taken.add(ctx.nName);
+    for (const n of this.used) taken.add(n);
+    // Everything the loop itself mentions must stay untouched: the body's
+    // other identifiers are still source bindings/globals.
+    collectAllNames(node, taken);
+    return pickRepairName(taken, this.used) || name;
   };
 
   /** Deterministic, RNG-free local name for a hoisted loop bound. */
@@ -841,12 +940,15 @@ function attachFunctionSplit(cls) {
       };
     }
     if (node.type === 'ForNumericStatement') {
+      const shadow = this.loopShadowsEnv(node.name, ctx, node.body);
+      const name = shadow ? this.repairLoopName(node.name, ctx, node.body) : node.name;
       const bound = new Set(ctx.bound);
-      bound.add(node.name);
+      bound.add(name);
       const inner = { ...ctx, bound };
+      if (shadow) inner.varRename = withRename(ctx.varRename, node.name, name);
       return {
         type: 'ForNumericStatement',
-        name: node.name,
+        name,
         start: this.rewrite(node.start, inner),
         stop: this.rewrite(node.stop, inner),
         step: node.step ? this.rewrite(node.step, inner) : node.step,
@@ -854,12 +956,24 @@ function attachFunctionSplit(cls) {
       };
     }
     if (node.type === 'ForGenericStatement') {
+      const renames = new Map();
+      const names = (node.names || []).map((n) => {
+        if (!this.loopShadowsEnv(n, ctx, node.body)) return n;
+        const fixed = this.repairLoopName(n, ctx, node.body);
+        renames.set(n, fixed);
+        return fixed;
+      });
       const bound = new Set(ctx.bound);
-      for (const n of node.names) bound.add(n);
+      for (const n of names) bound.add(n);
       const inner = { ...ctx, bound };
+      if (renames.size) {
+        let map = ctx.varRename;
+        for (const [from, to] of renames) map = withRename(map, from, to);
+        inner.varRename = map;
+      }
       return {
         type: 'ForGenericStatement',
-        names: node.names.slice(),
+        names,
         iters: this.rewrite(node.iters, inner),
         body: this.rewrite(node.body, inner),
       };
@@ -919,7 +1033,10 @@ function attachFunctionSplit(cls) {
 
   P.rewriteIdent = function rewriteIdent(node, ctx) {
     const name = node.name;
-    if (ctx.bound.has(name)) return ident(name);
+    if (ctx.bound.has(name)) {
+      if (ctx.varRename && ctx.varRename.has(name)) return ident(ctx.varRename.get(name));
+      return ident(name);
+    }
     if (ctx.scratch && ctx.scratch.has(name)) {
       return idx(ident(ctx.nName), this.num(ctx.scratch.get(name)));
     }

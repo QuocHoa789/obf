@@ -504,7 +504,21 @@ function internProto(root, seed) {
   const allNames = [...new Set([...valueList, ...stringList])].sort();
   const longestName = allNames.reduce((m, s) => Math.max(m, toBytes(s).length), 0);
   const Lmax = Math.max(longest, longestName);
-  const RK = 3 + Lmax;
+  // A literal's bytes are decoded into consecutive registers and handed to
+  // `charFunc` in ONE call, so the argument count is the literal length. The
+  // VM builds that call with `unpack(F, first, last)`, and unpack takes at most
+  // ~8000 results (LUAI_MAXCSTACK / Luau's stack limit): an 8 KB string literal
+  // aborted with "too many results to unpack". Decode long literals in batches
+  // instead; short literals keep the exact same register layout (and the exact
+  // same bytecode) as before.
+  const BATCH = 4000;
+  // Largest literal that the single-call decoder still handles (measured on
+  // Luau: 7990 bytes ok, 8000 aborts). Pools at or below this keep the exact
+  // register layout and bytecode they always had, so no working input changes.
+  const SINGLE_CALL_MAX = 7990;
+  const batched = Lmax > SINGLE_CALL_MAX;
+  const windowBytes = batched ? BATCH : Lmax;
+  const RK = 3 + windowBytes;
   const Rstate = RK + 1;
   const Rmix = RK + 2;
   const R_one = Rmix + 1;
@@ -517,6 +531,10 @@ function internProto(root, seed) {
   const R_Q = Rmix + 8;
   const R_imm = Rmix + 9;
   const R_tmp = Rmix + 10;
+  // Only allocated (and only reachable) for batched decoding; keeping them
+  // above R_tmp leaves every short-string register/bytecode unchanged.
+  const R_acc = R_tmp + 1;
+  const R_acc2 = R_tmp + 2;
   const mixSlot = total;
 
   const decoys = [];
@@ -655,9 +673,9 @@ function internProto(root, seed) {
     if (put.kind === 'number') put.kNum = addConst(put.key);
   }
 
-  const emitStreamByte = (i, enc, out) => {
+  const emitStreamByte = (i, enc, out, dst) => {
     const kEnc = addConst(enc);
-    const Ri = 3 + i;
+    const Ri = dst == null ? 3 + i : dst;
     const ki = addConst(i);
     out.push({ op: 'LOADK', A: RK, B: k33, C: 0, Bk: true, loc: null });
     out.push({ op: 'MUL', A: RK, B: Rmix, C: RK, loc: null });
@@ -694,14 +712,40 @@ function internProto(root, seed) {
   };
 
   const emitDecodeIntoR2 = (put, out) => {
-    out.push({ op: 'MOVE', A: FB, B: FC, C: 0, loc: null });
-    for (let i = 0; i < put.enc.length; i++) emitStreamByte(i, put.enc[i], out);
+    const n = put.enc.length;
+    if (!batched || n <= BATCH) {
+      out.push({ op: 'MOVE', A: FB, B: FC, C: 0, loc: null });
+      for (let i = 0; i < n; i++) emitStreamByte(i, put.enc[i], out);
+      emitMixSlot(put, out);
+      // Always call the decoder: a zero-length entry (the "" string) still has to
+      // produce the empty string from charFunc() instead of leaking the function
+      // itself into the intern table. The LEN mix for it adds 0 and is a no-op,
+      // but it is emitted anyway to keep the state chain uniform.
+      out.push({ op: 'CALL', A: FB, B: n + 1, C: 2, loc: null });
+      emitLenMix(FB, out);
+      return;
+    }
+    // Long literal: decode BATCH bytes per call and concatenate the pieces.
+    // `emitStreamByte` still walks the global byte index, so the keystream /
+    // Rmix chain stays identical to the single-call form — only the CALL (and
+    // therefore its argument count) is split.
+    for (let start = 0; start < n; start += BATCH) {
+      const len = Math.min(BATCH, n - start);
+      // The previous CALL left its result in FB; reload the decoder.
+      out.push({ op: 'MOVE', A: FB, B: FC, C: 0, loc: null });
+      for (let j = 0; j < len; j++) {
+        emitStreamByte(start + j, put.enc[start + j], out, 3 + j);
+      }
+      out.push({ op: 'CALL', A: FB, B: len + 1, C: 2, loc: null });
+      if (start === 0) {
+        out.push({ op: 'MOVE', A: R_acc, B: FB, C: 0, loc: null });
+      } else {
+        out.push({ op: 'MOVE', A: R_acc2, B: FB, C: 0, loc: null });
+        out.push({ op: 'CONCAT', A: R_acc, B: R_acc, C: R_acc2, loc: null });
+      }
+    }
     emitMixSlot(put, out);
-    // Always call the decoder: a zero-length entry (the "" string) still has to
-    // produce the empty string from charFunc() instead of leaking the function
-    // itself into the intern table. The LEN mix for it adds 0 and is a no-op,
-    // but it is emitted anyway to keep the state chain uniform.
-    out.push({ op: 'CALL', A: FB, B: put.enc.length + 1, C: 2, loc: null });
+    out.push({ op: 'MOVE', A: FB, B: R_acc, C: 0, loc: null });
     emitLenMix(FB, out);
   };
 
@@ -839,7 +883,7 @@ function internProto(root, seed) {
     _kind: 'fill',
     params: 2,
     isVararg: false,
-    maxstack: R_tmp + 1,
+    maxstack: batched ? R_acc2 + 1 : R_tmp + 1,
     locals: [],
     upvalues: [],
     constants: fillerConsts,

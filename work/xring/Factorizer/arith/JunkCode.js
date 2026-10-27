@@ -52,14 +52,23 @@ function reg() {
 // Same-register tautologies. The `or 0` keeps evaluation total on Luau:
 // Reg*[PC] can be nil on some steps and F[nil] errors (the JS harness
 // silently yields undefined, hiding the crash).
+//
+// `x == x` is NOT a tautology: IEEE-754 says every comparison with NaN is
+// false, and a payload that computes NaN (0/0, inf-inf, ...) can sit in any
+// register the junk touches. A bare `x == x` guard then turned false and the
+// *dead* arm -- traps, VM-state writes -- executed, corrupting or killing the
+// run. Each predicate therefore spells out both halves so one of them is
+// always true for every value including NaN:
+//   always true : (x == x) or  (x ~= x)
+//   always false: (x == x) and (x ~= x)
 function regEq() {
   const g = reg();
-  return `F[${g} or 0] == F[${g} or 0]`;
+  return `(F[${g} or 0] == F[${g} or 0]) or (F[${g} or 0] ~= F[${g} or 0])`;
 }
 
 function regNe() {
   const g = reg();
-  return `F[${g} or 0] ~= F[${g} or 0]`;
+  return `(F[${g} or 0] == F[${g} or 0]) and (F[${g} or 0] ~= F[${g} or 0])`;
 }
 
 function bytePred(blob, len, wantTrue) {
@@ -227,4 +236,4 @@ function emitJunk(ctx) {
   }
 }
 
-module.exports = { emitJunk, srand };
+module.exports = { emitJunk, srand, predTrue, predFalse, BUF };
