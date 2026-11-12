@@ -1,0 +1,14 @@
+{
+  "name": "xring",
+  "version": "0.1.0",
+  "description": "Xring Lua 5.1 obfuscator — AST compiler + interpreter VM (no JIT, no factorizer)",
+  "main": "index.js",
+  "bin": {
+    "xring": "./XringCLI/index.js"
+  },
+  "scripts": {
+    "test": "node XringCLI/tests/test.js",
+    "obfuscate": "node XringCLI/index.js"
+  },
+  "license": "UNLICENSED"
+}
